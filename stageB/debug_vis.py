@@ -35,6 +35,7 @@ def save_debug_plot(
     words: Sequence[object],
     fps: int,
     token_stride: int,
+    part_stats: Mapping[str, Mapping[str, object]] | None = None,
 ) -> None:
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,6 +79,24 @@ def save_debug_plot(
     axes[1].plot(time_token, gate[:n_tokens], color="#c45508", linewidth=1.4)
     axes[1].set_ylim(-0.05, 1.05)
     axes[1].set_title("Fusion Gate (content preference)")
+    if part_stats:
+        lines = []
+        for name, stats in part_stats.items():
+            if not isinstance(stats, Mapping):
+                continue
+            unique_codes = stats.get("unique_codes", 0)
+            top1_ratio = float(stats.get("top1_ratio", 0.0))
+            lines.append(f"{name}: uniq={unique_codes}, top1={top1_ratio:.2f}")
+        axes[1].text(
+            0.99,
+            0.05,
+            "\n".join(lines),
+            transform=axes[1].transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.75, "edgecolor": "#dddddd"},
+        )
 
     all_parts = list(token_codes.keys())
     axes[2].set_title("Ground Truth Tokens")

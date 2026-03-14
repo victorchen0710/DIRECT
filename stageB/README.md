@@ -85,6 +85,15 @@ Dual-branch means:
 - `generation branch`: all-mask code inputs, matched to validation/inference
 - `hint branch`: partial GT code hints, auxiliary gesture-prior training
 
+Current Stage2 semantic defaults prioritize upper-body expressiveness:
+- `upper_part_w=1.0`, `hand_part_w=1.0`, `lower_part_w=0.25`
+- `hint_branch_w=0.1`
+- `masked_ce_w=0.2`
+- `recon_w=0.15`, `vel_w=0.03`, `acc_w=0.01`
+- `code_hint_batch_drop_prob=0.4`
+- when loading spatial pretrain, `warmup_freeze_temporal_epochs=2`
+- best checkpoint selection defaults to `semantic_upper_hand`, not raw total loss
+
 Spatial pretraining:
 ```bash
 python stageB/train_stage2_semantic.py \
@@ -135,6 +144,11 @@ python stageB/infer_stage2_semantic_bvh.py \
   --textgrid beat/beat_english_v0.2.1/5/5_stewart_0_8_8.TextGrid \
   --stage2_ckpt checkpoints/stage2_semantic_audio_text_best.pt \
   --out_dir outputs/stage2_demo \
-  --refine_iters 2 \
   --device cuda
 ```
+
+Current inference defaults are:
+- `root_mode=hold`
+- `refine_iters=1`
+- `semantic_topk=8`
+- `semantic_temperature=1.1`

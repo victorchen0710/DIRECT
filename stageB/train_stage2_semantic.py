@@ -106,6 +106,64 @@ def get_amp_dtype(name: str) -> torch.dtype:
     return torch.float16
 
 
+def get_part_loss_weights(args, part_names: Sequence[str]) -> dict[str, float]:
+    defaults = {
+        "upper": float(args.upper_part_w),
+        "hand": float(args.hand_part_w),
+        "lower": float(args.lower_part_w),
+    }
+    return {name: float(defaults.get(name, 1.0)) for name in part_names}
+
+
+def compute_motion_energy(full_motion: np.ndarray) -> float:
+    motion = np.asarray(full_motion, dtype=np.float32)
+    if motion.ndim != 2 or motion.shape[0] < 2:
+        return 0.0
+    vel = np.abs(motion[1:] - motion[:-1])
+    return float(vel.mean())
+
+
+def summarize_code_sequence(codes: np.ndarray) -> dict[str, float | int]:
+    x = np.asarray(codes).reshape(-1)
+    if x.size <= 0:
+        return {"unique_codes": 0, "top1_ratio": 0.0}
+    uniq, counts = np.unique(x, return_counts=True)
+    return {
+        "unique_codes": int(uniq.size),
+        "top1_ratio": float(counts.max() / max(1, x.size)),
+    }
+
+
+def compute_semantic_best_score(metrics: dict) -> float:
+    upper_ce = float(metrics.get("upper_ce", 1e9))
+    hand_ce = float(metrics.get("hand_ce", 1e9))
+    lower_ce = float(metrics.get("lower_ce", 1e9))
+    upper_active = float(metrics.get("upper_active", 0.0))
+    hand_active = float(metrics.get("hand_active", 0.0))
+    score = upper_ce + hand_ce + 0.25 * lower_ce
+    if upper_active < 20.0:
+        score += 0.05 * (20.0 - upper_active)
+    if hand_active < 20.0:
+        score += 0.05 * (20.0 - hand_active)
+    return float(score)
+
+
+def select_best_score(*, args, train_metrics: dict, val_metrics: Optional[dict]) -> float:
+    metrics = val_metrics or train_metrics
+    if args.train_mode == "stage2_finetune" and args.best_metric_mode == "semantic_upper_hand":
+        return compute_semantic_best_score(metrics)
+    return float(metrics["loss"])
+
+
+def configure_finetune_trainable_state(model: AudioTextTokenPredictor, *, freeze_temporal_and_heads: bool) -> None:
+    for param in model.parameters():
+        param.requires_grad_(True)
+    if freeze_temporal_and_heads:
+        for module in (model.temporal, model.heads):
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+
 def save_stage2_ckpt(
     path: Path,
     *,
@@ -175,6 +233,7 @@ def compute_branch_objective(
     branch_loss = ref.new_tensor(0.0, dtype=torch.float32)
     batch_metrics: dict[str, float] = {}
     decoded_parts: dict[str, torch.Tensor] = {}
+    part_loss_weights = get_part_loss_weights(args, codec_bundle.primary_part_names)
 
     for name in codec_bundle.primary_part_names:
         logits = outputs["logits"][name]
@@ -214,7 +273,12 @@ def compute_branch_objective(
             accel = weighted_acceleration_loss(decoded, part_motion[name], frame_weights)
             part_loss = part_loss + args.recon_w * recon + args.vel_w * vel + args.acc_w * accel
 
-        branch_loss = branch_loss + part_loss
+        part_weight = float(part_loss_weights.get(name, 1.0))
+        weighted_part_loss = part_loss * part_weight
+        branch_loss = branch_loss + weighted_part_loss
+        batch_metrics[_branch_metric_name(name, "part_w", branch)] = float(part_weight)
+        batch_metrics[_branch_metric_name(name, "part_loss", branch)] = float(part_loss.detach().item())
+        batch_metrics[_branch_metric_name(name, "weighted_part_loss", branch)] = float(weighted_part_loss.detach().item())
         batch_metrics[_branch_metric_name(name, "ce", branch)] = float(ce_loss.detach().item())
         batch_metrics[_branch_metric_name(name, "masked_ce", branch)] = float(masked_ce.detach().item())
         batch_metrics[_branch_metric_name(name, "usage", branch)] = float(usage_loss.detach().item())
@@ -709,7 +773,7 @@ def run_epoch(
         totals["fk_hand_vel"] += float(fk_hand_vel.detach().item())
         totals["fk_hand_acc"] += float(fk_hand_acc.detach().item())
         for key, value in batch_metrics.items():
-            totals[key] += float(value)
+            totals[key] = totals.get(key, 0.0) + float(value)
 
         samples_seen += int(full_motion.shape[0])
         tokens_seen += int(full_motion.shape[0]) * int(next(iter(code_targets.values())).shape[1])
@@ -725,13 +789,27 @@ def run_epoch(
         )
 
         if debug_payload is None:
+            pred_codes_np = {
+                name: torch.argmax(gen_outputs["logits"][name][0], dim=-1).detach().cpu().numpy()
+                for name in codec_bundle.primary_part_names
+            }
+            probe_full = codec_bundle.merge_decoded_parts(
+                {name: decoded_parts[name][0].detach().cpu().numpy() for name in decoded_parts},
+                gt_full=full_motion[0].detach().cpu().numpy(),
+            )
+            probe_stats = {
+                name: summarize_code_sequence(pred_codes_np[name])
+                for name in codec_bundle.primary_part_names
+            }
+            probe_stats["motion_energy"] = compute_motion_energy(probe_full)
             debug_payload = {
                 "prosody_frame": batch["prosody_frame"][0].detach().cpu().numpy(),
                 "fusion_gate": gen_outputs["fusion_gate"][0, :, 0].detach().cpu().numpy(),
                 "hint_gate": gen_outputs["hint_gate"][0, :, 0].detach().cpu().numpy(),
                 "token_gt": {name: code_targets[name][0].detach().cpu().numpy() for name in codec_bundle.primary_part_names},
-                "token_pred": {name: torch.argmax(gen_outputs["logits"][name][0], dim=-1).detach().cpu().numpy() for name in codec_bundle.primary_part_names},
+                "token_pred": pred_codes_np,
                 "words": batch["meta"][0]["words"],
+                "probe_stats": probe_stats,
             }
 
     progress.close()
@@ -750,7 +828,7 @@ def main():
     parser.add_argument("--save", type=str, default="checkpoints/stage2_semantic.pt")
     parser.add_argument("--train_mode", choices=["spatial_pretrain", "stage2_finetune"], default="stage2_finetune")
     parser.add_argument("--load_spatial_pretrain", type=str, default=None)
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -769,18 +847,23 @@ def main():
     parser.add_argument("--code_hint_mask_span", type=int, default=3)
     parser.add_argument("--code_hint_random_replace_prob", type=float, default=0.1)
     parser.add_argument("--code_hint_keep_prob", type=float, default=0.1)
-    parser.add_argument("--code_hint_batch_drop_prob", type=float, default=0.15)
+    parser.add_argument("--code_hint_batch_drop_prob", type=float, default=0.4)
     parser.add_argument("--disable_dual_branch", action="store_true")
     parser.add_argument("--gen_branch_w", type=float, default=1.0)
-    parser.add_argument("--hint_branch_w", type=float, default=0.5)
+    parser.add_argument("--hint_branch_w", type=float, default=0.1)
     parser.add_argument("--decoder_softmax_temp", type=float, default=1.0)
     parser.add_argument("--label_smoothing", type=float, default=0.05)
-    parser.add_argument("--masked_ce_w", type=float, default=0.5)
+    parser.add_argument("--masked_ce_w", type=float, default=0.2)
     parser.add_argument("--usage_w", type=float, default=0.02)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--amp_dtype", choices=["fp16", "bf16"], default="fp16")
     parser.add_argument("--data_parallel", action="store_true")
     parser.add_argument("--gpu_ids", type=str, default=None)
+    parser.add_argument("--upper_part_w", type=float, default=1.0)
+    parser.add_argument("--hand_part_w", type=float, default=1.0)
+    parser.add_argument("--lower_part_w", type=float, default=0.25)
+    parser.add_argument("--warmup_freeze_temporal_epochs", type=int, default=2)
+    parser.add_argument("--best_metric_mode", choices=["loss", "semantic_upper_hand"], default="semantic_upper_hand")
     parser.add_argument("--spatial_tasks", type=str, default="upper_to_hand,upper_to_lower,hand_to_upper,upper_hand_to_lower")
     parser.add_argument("--spatial_task_weights", type=str, default=None)
     parser.add_argument("--spatial_code_dim", type=int, default=128)
@@ -789,9 +872,9 @@ def main():
     parser.add_argument("--spatial_fk_hand_pos_w", type=float, default=0.0)
 
     parser.add_argument("--ce_w", type=float, default=1.0)
-    parser.add_argument("--recon_w", type=float, default=0.5)
-    parser.add_argument("--vel_w", type=float, default=0.1)
-    parser.add_argument("--acc_w", type=float, default=0.05)
+    parser.add_argument("--recon_w", type=float, default=0.15)
+    parser.add_argument("--vel_w", type=float, default=0.03)
+    parser.add_argument("--acc_w", type=float, default=0.01)
     parser.add_argument("--fk_hand_pos_w", type=float, default=0.0)
     parser.add_argument("--fk_hand_vel_w", type=float, default=0.0)
     parser.add_argument("--fk_hand_acc_w", type=float, default=0.0)
@@ -859,6 +942,15 @@ def main():
     spatial_load_info = None
     if args.load_spatial_pretrain:
         spatial_load_info = load_spatial_pretrain_weights(unwrap_model(model), args.load_spatial_pretrain)
+    warmup_freeze_enabled = bool(
+        args.train_mode == "stage2_finetune"
+        and args.load_spatial_pretrain
+        and int(args.warmup_freeze_temporal_epochs) > 0
+    )
+    configure_finetune_trainable_state(
+        unwrap_model(model),
+        freeze_temporal_and_heads=warmup_freeze_enabled,
+    )
 
     params = list(model.parameters())
     if args.finetune_stage1_decoder:
@@ -925,6 +1017,9 @@ def main():
                 "dual_branch": (not args.disable_dual_branch),
                 "gen_branch_w": args.gen_branch_w,
                 "hint_branch_w": args.hint_branch_w,
+                "part_loss_weights": get_part_loss_weights(args, codec_bundle.primary_part_names),
+                "warmup_freeze_temporal_epochs": int(args.warmup_freeze_temporal_epochs),
+                "best_metric_mode": args.best_metric_mode,
                 "data_parallel": bool(data_parallel_enabled and len(gpu_ids) > 1),
                 "gpu_ids": gpu_ids,
                 "train_cache_gb": round(train_cache_size_gb, 2),
@@ -939,6 +1034,15 @@ def main():
     )
 
     for epoch in range(1, args.epochs + 1):
+        freeze_temporal_now = bool(
+            args.train_mode == "stage2_finetune"
+            and args.load_spatial_pretrain
+            and epoch <= int(args.warmup_freeze_temporal_epochs)
+        )
+        configure_finetune_trainable_state(
+            unwrap_model(model),
+            freeze_temporal_and_heads=freeze_temporal_now,
+        )
         if args.train_mode == "spatial_pretrain":
             train_metrics, _ = run_epoch_spatial(
                 model=model,
@@ -975,8 +1079,8 @@ def main():
         if not train_metrics:
             raise RuntimeError("Training produced no valid batches.")
 
-        log = {"epoch": epoch, "train": train_metrics}
-        score = train_metrics["loss"]
+        log = {"epoch": epoch, "train": train_metrics, "warmup_freeze_temporal": freeze_temporal_now}
+        score = select_best_score(args=args, train_metrics=train_metrics, val_metrics=None)
 
         if val_loader is not None:
             with torch.no_grad():
@@ -1015,8 +1119,9 @@ def main():
                     )
             if val_metrics:
                 log["val"] = val_metrics
-                score = val_metrics["loss"]
+                score = select_best_score(args=args, train_metrics=train_metrics, val_metrics=val_metrics)
                 if debug_payload is not None:
+                    log["probe"] = debug_payload.get("probe_stats", {})
                     if args.train_mode == "spatial_pretrain":
                         torch.save(debug_payload, debug_dir / f"epoch_{epoch:03d}_spatial_debug.pt")
                     else:
@@ -1029,7 +1134,13 @@ def main():
                             words=debug_payload["words"],
                             fps=train_ds.meta.get("fps", 15),
                             token_stride=train_ds.token_stride,
+                            part_stats=debug_payload.get("probe_stats"),
                         )
+                        (debug_dir / f"epoch_{epoch:03d}_probe.json").write_text(
+                            json.dumps(debug_payload.get("probe_stats", {}), indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+        log["best_score"] = float(score)
 
         print(json.dumps(log, ensure_ascii=False))
 

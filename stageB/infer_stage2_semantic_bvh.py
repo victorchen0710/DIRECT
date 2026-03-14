@@ -95,6 +95,44 @@ def build_refine_code_inputs(
     return code_inputs
 
 
+def sample_semantic_codes(
+    logits: torch.Tensor,
+    *,
+    temperature: float,
+    topk: int,
+) -> torch.Tensor:
+    if int(topk) <= 1 or float(temperature) <= 0.0:
+        return torch.argmax(logits, dim=-1)
+    topk = min(int(topk), int(logits.shape[-1]))
+    scaled = logits / max(float(temperature), 1e-4)
+    top_vals, top_idx = torch.topk(scaled, k=topk, dim=-1)
+    probs = torch.softmax(top_vals, dim=-1)
+    sampled = torch.multinomial(probs.reshape(-1, topk), num_samples=1).view(*logits.shape[:-1], 1)
+    return torch.gather(top_idx, dim=-1, index=sampled).squeeze(-1)
+
+
+def summarize_predicted_codes(pred_codes: dict[str, torch.Tensor]) -> dict[str, dict[str, float | int]]:
+    summary: dict[str, dict[str, float | int]] = {}
+    for name, codes in pred_codes.items():
+        flat = codes.detach().cpu().reshape(-1)
+        if flat.numel() <= 0:
+            summary[name] = {"unique_codes": 0, "top1_ratio": 0.0}
+            continue
+        hist = torch.bincount(flat)
+        summary[name] = {
+            "unique_codes": int((hist > 0).sum().item()),
+            "top1_ratio": float(hist.max().item() / max(1, flat.numel())),
+        }
+    return summary
+
+
+def compute_motion_energy(full_motion: np.ndarray) -> float:
+    motion = np.asarray(full_motion, dtype=np.float32)
+    if motion.ndim != 2 or motion.shape[0] < 2:
+        return 0.0
+    return float(np.abs(motion[1:] - motion[:-1]).mean())
+
+
 def main():
     parser = argparse.ArgumentParser(description="Infer semantic StageB motion and export BVH.")
     parser.add_argument("--wav", type=str, required=True)
@@ -104,9 +142,11 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--ref_bvh", type=str, default=None)
     parser.add_argument("--tier_name", type=str, default=None)
-    parser.add_argument("--root_mode", choices=["zero", "ref", "hold"], default="zero")
-    parser.add_argument("--refine_iters", type=int, default=2)
+    parser.add_argument("--root_mode", choices=["zero", "ref", "hold"], default="hold")
+    parser.add_argument("--refine_iters", type=int, default=1)
     parser.add_argument("--refine_confidence", type=float, default=0.6)
+    parser.add_argument("--semantic_topk", type=int, default=8)
+    parser.add_argument("--semantic_temperature", type=float, default=1.1)
     parser.add_argument("--bert_model_dir", type=str, default=None)
     parser.add_argument("--bert_device", type=str, default=None)
     parser.add_argument("--bert_max_words", type=int, default=128)
@@ -217,7 +257,16 @@ def main():
                 token_text_bert=token_text_bert_t,
                 token_code_inputs=token_code_inputs,
             )
-            pred_codes = {name: torch.argmax(logits, dim=-1) for name, logits in outputs["logits"].items()}
+            pred_codes = {}
+            for name, logits in outputs["logits"].items():
+                if name in {"upper", "hand"}:
+                    pred_codes[name] = sample_semantic_codes(
+                        logits,
+                        temperature=args.semantic_temperature,
+                        topk=args.semantic_topk,
+                    )
+                else:
+                    pred_codes[name] = torch.argmax(logits, dim=-1)
             if not model.use_code_hints or refine_idx >= max(1, int(args.refine_iters)) - 1:
                 break
             token_code_inputs = build_refine_code_inputs(
@@ -234,6 +283,8 @@ def main():
     full_motion = codec_bundle.merge_decoded_parts(decoded_parts, gt_full=None)
     full_motion = np.asarray(full_motion, dtype=np.float32)
     full_motion = apply_root_fallback(full_motion, ref_bvh=codec_bundle.ref_bvh, root_mode=args.root_mode)
+    code_stats = summarize_predicted_codes(pred_codes)
+    motion_energy = compute_motion_energy(full_motion)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -259,6 +310,7 @@ def main():
         words=text_frame.words,
         fps=TARGET_FPS,
         token_stride=codec_bundle.token_stride,
+        part_stats=code_stats,
     )
 
     summary = {
@@ -272,7 +324,11 @@ def main():
         "root_mode": args.root_mode,
         "refine_iters": int(args.refine_iters),
         "refine_confidence": float(args.refine_confidence),
+        "semantic_topk": int(args.semantic_topk),
+        "semantic_temperature": float(args.semantic_temperature),
         "bert_feature_dim": bert_feature_dim,
+        "code_stats": code_stats,
+        "motion_energy": motion_energy,
         "outputs": {
             "motion_npy": str(motion_path),
             "codes_pt": str(code_path),
