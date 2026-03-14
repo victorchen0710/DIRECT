@@ -1,0 +1,23 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+torchaudio
+transformers==4.46.0
+tokenizers==0.20.3
+huggingface-hub==0.25.2
+diffusers
+accelerate
+einops
+ema-pytorch
+whisperx
+librosa
+soundfile
+numpy<2.0
+pandas
+scipy
+matplotlib
+tensorboard
+protobuf
+sentencepiece
+idna
+requests
