@@ -7,7 +7,7 @@ checkpoints/
 outputs/
 beat/
 diffusion/
-models/
+/models/
 w2v2_base/
 
 *.pt
@@ -15,4 +15,3 @@ w2v2_base/
 *.ckpt
 *.npz
 *.npy
-
