@@ -32,6 +32,22 @@ def _to_numpy_f32(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
 
 
+def _cast_part_like(
+    part_motion: np.ndarray | torch.Tensor,
+    reference: Optional[np.ndarray | torch.Tensor],
+) -> np.ndarray | torch.Tensor:
+    if reference is None:
+        return part_motion
+    if torch.is_tensor(reference):
+        if torch.is_tensor(part_motion):
+            return part_motion.to(device=reference.device, dtype=reference.dtype)
+        return torch.as_tensor(part_motion, device=reference.device, dtype=reference.dtype)
+    ref_arr = np.asarray(reference)
+    if torch.is_tensor(part_motion):
+        return part_motion.detach().cpu().numpy().astype(ref_arr.dtype, copy=False)
+    return np.asarray(part_motion, dtype=ref_arr.dtype)
+
+
 @dataclass
 class MotionCodecPart:
     name: str
@@ -193,7 +209,8 @@ class MotionCodecBundle:
         for name in self.primary_part_names:
             if name not in decoded_parts:
                 continue
-            out = merge_parts_back_to_full(decoded_parts[name], self.parts[name].motion_spec, gt_full=out)
+            part_motion = _cast_part_like(decoded_parts[name], out)
+            out = merge_parts_back_to_full(part_motion, self.parts[name].motion_spec, gt_full=out)
         if out is None:
             raise RuntimeError("Cannot merge parts without decoded inputs.")
         return out

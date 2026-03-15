@@ -134,6 +134,68 @@ def summarize_code_sequence(codes: np.ndarray) -> dict[str, float | int]:
     }
 
 
+def summarize_parts_for_console(metrics: Optional[dict], part_names: Sequence[str]) -> dict:
+    if not metrics:
+        return {}
+    out = {}
+    for name in part_names:
+        out[name] = {
+            "ppl": round(float(metrics.get(f"{name}_ppl", 0.0)), 2),
+            "active": round(float(metrics.get(f"{name}_active", 0.0)), 2),
+        }
+    return out
+
+
+def summarize_probe_for_console(probe_stats: Optional[dict], part_names: Sequence[str]) -> dict:
+    if not probe_stats:
+        return {}
+    out = {}
+    for name in part_names:
+        part_stats = probe_stats.get(name, {})
+        if not isinstance(part_stats, dict):
+            continue
+        out[name] = {
+            "uniq": int(part_stats.get("unique_codes", 0)),
+            "top1": round(float(part_stats.get("top1_ratio", 0.0)), 3),
+        }
+    if "motion_energy" in probe_stats:
+        out["motion_energy"] = round(float(probe_stats["motion_energy"]), 6)
+    return out
+
+
+def make_console_epoch_log(
+    *,
+    epoch: int,
+    train_mode: str,
+    train_metrics: dict,
+    val_metrics: Optional[dict],
+    probe_stats: Optional[dict],
+    best_score: float,
+    warmup_freeze_temporal: bool,
+    part_names: Sequence[str],
+) -> dict:
+    log = {
+        "epoch": int(epoch),
+        "mode": train_mode,
+        "best_score": round(float(best_score), 4),
+        "warmup_freeze_temporal": bool(warmup_freeze_temporal),
+        "train": {
+            "loss": round(float(train_metrics.get("loss", 0.0)), 4),
+            "gen_loss": round(float(train_metrics.get("gen_loss", train_metrics.get("loss", 0.0))), 4),
+            "parts": summarize_parts_for_console(train_metrics, part_names),
+        },
+    }
+    if val_metrics:
+        log["val"] = {
+            "loss": round(float(val_metrics.get("loss", 0.0)), 4),
+            "gen_loss": round(float(val_metrics.get("gen_loss", val_metrics.get("loss", 0.0))), 4),
+            "parts": summarize_parts_for_console(val_metrics, part_names),
+        }
+    if probe_stats:
+        log["probe"] = summarize_probe_for_console(probe_stats, part_names)
+    return log
+
+
 def compute_semantic_best_score(metrics: dict) -> float:
     upper_ce = float(metrics.get("upper_ce", 1e9))
     hand_ce = float(metrics.get("hand_ce", 1e9))
@@ -162,6 +224,43 @@ def configure_finetune_trainable_state(model: AudioTextTokenPredictor, *, freeze
         for module in (model.temporal, model.heads):
             for param in module.parameters():
                 param.requires_grad_(False)
+
+
+def optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device, non_blocking=(device.type == "cuda"))
+
+
+def load_stage2_resume(
+    *,
+    ckpt_path: str | Path,
+    model: AudioTextTokenPredictor,
+    optimizer: torch.optim.Optimizer,
+    codec_bundle,
+    device: torch.device,
+    finetune_stage1_decoder: bool,
+    lr: float,
+    weight_decay: float,
+) -> dict:
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    state = ckpt.get("model", ckpt)
+    model.load_state_dict(state, strict=True)
+    if "optimizer" in ckpt and ckpt["optimizer"] is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
+        optimizer_to_device(optimizer, device)
+        for group in optimizer.param_groups:
+            group["lr"] = float(lr)
+            group["weight_decay"] = float(weight_decay)
+    if finetune_stage1_decoder:
+        codec_bundle.apply_stage1_overrides(ckpt.get("stage1_decoder_overrides"))
+    return {
+        "epoch": int(ckpt.get("epoch", 0)),
+        "best_metric": float(ckpt.get("best_metric", float("inf"))),
+        "train_mode": ckpt.get("train_mode"),
+        "args": ckpt.get("args"),
+    }
 
 
 def save_stage2_ckpt(
@@ -471,7 +570,8 @@ def run_epoch_spatial_single(
         progress.set_postfix(
             task=batch_task.name,
             loss=f"{float(loss.detach().item()):.4f}",
-            acc=f"{batch_metrics.get(f'{batch_task.name}_acc', 0.0):.3f}",
+            ppl=f"{batch_metrics.get(f'{batch_task.name}_ppl', 0.0):.1f}",
+            active=f"{batch_metrics.get(f'{batch_task.name}_active', 0.0):.1f}",
             tok_s=f"{tokens_seen / elapsed:.0f}",
         )
 
@@ -588,6 +688,7 @@ def run_epoch(
     codec_bundle,
     args,
     fk: Optional[BVHFkTorch],
+    foot_joint_ids: Optional[list[int]],
     hand_joint_ids: Optional[list[int]],
     split: str,
     epoch: int,
@@ -619,6 +720,8 @@ def run_epoch(
         totals[f"{name}_hint_active"] = 0.0
     totals["gen_loss"] = 0.0
     totals["hint_loss"] = 0.0
+    totals["fk_foot_pos"] = 0.0
+    totals["fk_foot_lock"] = 0.0
     totals["fk_hand_pos"] = 0.0
     totals["fk_hand_vel"] = 0.0
     totals["fk_hand_acc"] = 0.0
@@ -711,22 +814,41 @@ def run_epoch(
                 compute_motion_losses=True,
             )
 
+            fk_foot_pos = full_motion.new_tensor(0.0)
+            fk_foot_lock = full_motion.new_tensor(0.0)
             fk_hand_pos = full_motion.new_tensor(0.0)
             fk_hand_vel = full_motion.new_tensor(0.0)
             fk_hand_acc = full_motion.new_tensor(0.0)
-            if fk is not None and hand_joint_ids:
+            if fk is not None and (
+                ((foot_joint_ids is not None) and len(foot_joint_ids) > 0 and (args.fk_foot_pos_w > 0.0 or args.fk_foot_lock_w > 0.0))
+                or ((hand_joint_ids is not None) and len(hand_joint_ids) > 0 and (args.fk_hand_pos_w > 0.0 or args.fk_hand_vel_w > 0.0 or args.fk_hand_acc_w > 0.0))
+            ):
                 pred_full = codec_bundle.merge_decoded_parts(decoded_parts, gt_full=full_motion)
                 pos_gt = fk.fk_positions(full_motion)
                 pos_pd = fk.fk_positions(pred_full)
-                fk_hand_pos, fk_hand_vel, fk_hand_acc = fk_joint_losses(
-                    pos_gt=pos_gt,
-                    pos_pd=pos_pd,
-                    joint_ids=hand_joint_ids,
-                    pos_w=args.fk_hand_pos_w,
-                    vel_w=args.fk_hand_vel_w,
-                    acc_w=args.fk_hand_acc_w,
-                )
-                gen_loss = gen_loss + fk_hand_pos + fk_hand_vel + fk_hand_acc
+                if foot_joint_ids and (args.fk_foot_pos_w > 0.0 or args.fk_foot_lock_w > 0.0):
+                    foot_sel = torch.as_tensor(foot_joint_ids, device=full_motion.device, dtype=torch.long)
+                    gt_f = pos_gt[:, :, foot_sel, :]
+                    pd_f = pos_pd[:, :, foot_sel, :]
+                    if args.fk_foot_pos_w > 0.0:
+                        fk_foot_pos = float(args.fk_foot_pos_w) * F.smooth_l1_loss(pd_f, gt_f)
+                    if args.fk_foot_lock_w > 0.0 and gt_f.shape[1] >= 2:
+                        v_gt = gt_f[:, 1:] - gt_f[:, :-1]
+                        gt_speed = torch.linalg.norm(v_gt, dim=-1)
+                        mask = (gt_speed < float(args.fk_contact_vel_th)).to(dtype=full_motion.dtype)
+                        v_pd = pd_f[:, 1:] - pd_f[:, :-1]
+                        per_step = F.smooth_l1_loss(v_pd, torch.zeros_like(v_pd), reduction="none").mean(dim=-1)
+                        fk_foot_lock = float(args.fk_foot_lock_w) * (per_step * mask).sum() / (mask.sum() + 1e-6)
+                if hand_joint_ids and (args.fk_hand_pos_w > 0.0 or args.fk_hand_vel_w > 0.0 or args.fk_hand_acc_w > 0.0):
+                    fk_hand_pos, fk_hand_vel, fk_hand_acc = fk_joint_losses(
+                        pos_gt=pos_gt,
+                        pos_pd=pos_pd,
+                        joint_ids=hand_joint_ids,
+                        pos_w=args.fk_hand_pos_w,
+                        vel_w=args.fk_hand_vel_w,
+                        acc_w=args.fk_hand_acc_w,
+                    )
+                gen_loss = gen_loss + fk_foot_pos + fk_foot_lock + fk_hand_pos + fk_hand_vel + fk_hand_acc
 
             hint_loss = full_motion.new_tensor(0.0)
             if hint_code_inputs is not None:
@@ -769,6 +891,8 @@ def run_epoch(
         totals["gen_loss"] += float(gen_loss.detach().item())
         totals["hint_loss"] += float(hint_loss.detach().item())
         totals["n"] += 1.0
+        totals["fk_foot_pos"] += float(fk_foot_pos.detach().item())
+        totals["fk_foot_lock"] += float(fk_foot_lock.detach().item())
         totals["fk_hand_pos"] += float(fk_hand_pos.detach().item())
         totals["fk_hand_vel"] += float(fk_hand_vel.detach().item())
         totals["fk_hand_acc"] += float(fk_hand_acc.detach().item())
@@ -781,9 +905,10 @@ def run_epoch(
 
         progress.set_postfix(
             loss=f"{float(total_loss.detach().item()):.4f}",
-            upper_acc=f"{batch_metrics.get('upper_acc', 0.0):.3f}",
-            hand_acc=f"{batch_metrics.get('hand_acc', 0.0):.3f}",
-            lower_acc=f"{batch_metrics.get('lower_acc', 0.0):.3f}",
+            upper_ppl=f"{batch_metrics.get('upper_ppl', 0.0):.1f}",
+            hand_ppl=f"{batch_metrics.get('hand_ppl', 0.0):.1f}",
+            upper_act=f"{batch_metrics.get('upper_active', 0.0):.1f}",
+            hand_act=f"{batch_metrics.get('hand_active', 0.0):.1f}",
             hint=f"{float(hint_loss.detach().item()):.2f}",
             tok_s=f"{tokens_seen / elapsed:.0f}",
         )
@@ -828,6 +953,7 @@ def main():
     parser.add_argument("--save", type=str, default="checkpoints/stage2_semantic.pt")
     parser.add_argument("--train_mode", choices=["spatial_pretrain", "stage2_finetune"], default="stage2_finetune")
     parser.add_argument("--load_spatial_pretrain", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -875,6 +1001,9 @@ def main():
     parser.add_argument("--recon_w", type=float, default=0.15)
     parser.add_argument("--vel_w", type=float, default=0.03)
     parser.add_argument("--acc_w", type=float, default=0.01)
+    parser.add_argument("--fk_foot_pos_w", type=float, default=0.0)
+    parser.add_argument("--fk_foot_lock_w", type=float, default=0.0)
+    parser.add_argument("--fk_contact_vel_th", type=float, default=0.1)
     parser.add_argument("--fk_hand_pos_w", type=float, default=0.0)
     parser.add_argument("--fk_hand_vel_w", type=float, default=0.0)
     parser.add_argument("--fk_hand_acc_w", type=float, default=0.0)
@@ -957,6 +1086,19 @@ def main():
         params.extend(list(codec_bundle.iter_trainable_decoder_parameters()))
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
+    resume_info = None
+    if args.resume:
+        resume_info = load_stage2_resume(
+            ckpt_path=args.resume,
+            model=unwrap_model(model),
+            optimizer=optimizer,
+            codec_bundle=codec_bundle,
+            device=device,
+            finetune_stage1_decoder=bool(args.finetune_stage1_decoder),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -979,9 +1121,18 @@ def main():
         )
 
     fk = None
+    foot_joint_ids = None
     hand_joint_ids = None
-    if args.fk_hand_pos_w > 0.0 or args.fk_hand_vel_w > 0.0 or args.fk_hand_acc_w > 0.0:
+    if (
+        args.fk_foot_pos_w > 0.0
+        or args.fk_foot_lock_w > 0.0
+        or args.fk_hand_pos_w > 0.0
+        or args.fk_hand_vel_w > 0.0
+        or args.fk_hand_acc_w > 0.0
+    ):
         fk = BVHFkTorch(codec_bundle.skel, drop_root_pos=False).to_device_tensors(device)
+        foot_joint_ids = codec_bundle.skel.find_joints_by_keywords(["RightFoot", "LeftFoot", "Foot", "ToeBase", "Toe"])
+        foot_joint_ids = [idx for idx in foot_joint_ids if "End" not in codec_bundle.skel.joints[idx].name]
         hand_joint_ids = codec_bundle.skel.find_joints_by_keywords(["RightHand", "LeftHand", "Hand"])
         hand_joint_ids = [idx for idx in hand_joint_ids if "End" not in codec_bundle.skel.joints[idx].name]
 
@@ -994,7 +1145,8 @@ def main():
             idx for idx in args._spatial_hand_joint_ids if "End" not in codec_bundle.skel.joints[idx].name
         ]
 
-    best_metric = float("inf")
+    best_metric = float(resume_info["best_metric"]) if resume_info is not None else float("inf")
+    start_epoch = int(resume_info["epoch"]) + 1 if resume_info is not None else 1
     save_path = Path(args.save)
     debug_dir = Path(args.debug_dir)
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -1027,13 +1179,21 @@ def main():
                 "spatial_task_weights": {task.name: weight for task, weight in zip(spatial_tasks, spatial_task_weights)},
                 "load_spatial_pretrain": args.load_spatial_pretrain,
                 "spatial_load_info": spatial_load_info,
+                "resume": args.resume,
+                "resume_info": resume_info,
+                "start_epoch": start_epoch,
             },
             ensure_ascii=False,
         ),
         flush=True,
     )
 
-    for epoch in range(1, args.epochs + 1):
+    if start_epoch > int(args.epochs):
+        raise RuntimeError(
+            f"--resume checkpoint is already at epoch {start_epoch - 1}, which is >= requested --epochs {args.epochs}."
+        )
+
+    for epoch in range(start_epoch, args.epochs + 1):
         freeze_temporal_now = bool(
             args.train_mode == "stage2_finetune"
             and args.load_spatial_pretrain
@@ -1070,6 +1230,7 @@ def main():
                 codec_bundle=codec_bundle,
                 args=args,
                 fk=fk,
+                foot_joint_ids=foot_joint_ids,
                 hand_joint_ids=hand_joint_ids,
                 split="train",
                 epoch=epoch,
@@ -1111,6 +1272,7 @@ def main():
                         codec_bundle=codec_bundle,
                         args=args,
                         fk=fk,
+                        foot_joint_ids=foot_joint_ids,
                         hand_joint_ids=hand_joint_ids,
                         split="val",
                         epoch=epoch,
@@ -1141,8 +1303,19 @@ def main():
                             encoding="utf-8",
                         )
         log["best_score"] = float(score)
-
-        print(json.dumps(log, ensure_ascii=False))
+        full_log_path = debug_dir / f"epoch_{epoch:03d}_metrics_full.json"
+        full_log_path.write_text(json.dumps(log, indent=2, ensure_ascii=False), encoding="utf-8")
+        console_log = make_console_epoch_log(
+            epoch=epoch,
+            train_mode=args.train_mode,
+            train_metrics=train_metrics,
+            val_metrics=log.get("val"),
+            probe_stats=log.get("probe"),
+            best_score=score,
+            warmup_freeze_temporal=freeze_temporal_now,
+            part_names=codec_bundle.primary_part_names,
+        )
+        print(json.dumps(console_log, ensure_ascii=False))
 
         save_stage2_ckpt(
             save_path,
