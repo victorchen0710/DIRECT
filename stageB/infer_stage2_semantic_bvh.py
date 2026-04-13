@@ -133,6 +133,16 @@ def compute_motion_energy(full_motion: np.ndarray) -> float:
     return float(np.abs(motion[1:] - motion[:-1]).mean())
 
 
+def _window_starts(total_steps: int, block_steps: int, hop_steps: int) -> list[int]:
+    if total_steps <= block_steps:
+        return [0]
+    starts = list(range(0, total_steps - block_steps + 1, max(1, hop_steps)))
+    tail_start = total_steps - block_steps
+    if starts[-1] != tail_start:
+        starts.append(tail_start)
+    return starts
+
+
 def main():
     parser = argparse.ArgumentParser(description="Infer semantic StageB motion and export BVH.")
     parser.add_argument("--wav", type=str, required=True)
@@ -147,6 +157,8 @@ def main():
     parser.add_argument("--refine_confidence", type=float, default=0.6)
     parser.add_argument("--semantic_topk", type=int, default=8)
     parser.add_argument("--semantic_temperature", type=float, default=1.1)
+    parser.add_argument("--infer_block_size_frames", type=int, default=0)
+    parser.add_argument("--infer_hop_frames", type=int, default=0)
     parser.add_argument("--bert_model_dir", type=str, default=None)
     parser.add_argument("--bert_device", type=str, default=None)
     parser.add_argument("--bert_max_words", type=int, default=128)
@@ -238,43 +250,99 @@ def main():
     token_text_bert_t = torch.from_numpy(token_text_bert).unsqueeze(0).to(device)
 
     codebook_sizes = {name: part.n_codes for name, part in codec_bundle.vq_parts.items()}
-    token_code_inputs = None
-    if model.use_code_hints:
-        token_code_inputs = build_all_mask_code_inputs(
-            (int(token_prosody_t.shape[0]), int(token_prosody_t.shape[1])),
-            codebook_sizes,
-            device,
+    ckpt_block_frames = int(stage2_ckpt.get("block_size", 0))
+    infer_block_frames = int(args.infer_block_size_frames) if int(args.infer_block_size_frames) > 0 else ckpt_block_frames
+    if infer_block_frames <= 0:
+        infer_block_frames = int(token_prosody_t.shape[1]) * int(codec_bundle.token_stride)
+    if infer_block_frames % int(codec_bundle.token_stride) != 0:
+        raise ValueError(
+            f"infer_block_size_frames={infer_block_frames} must be divisible by token_stride={codec_bundle.token_stride}"
         )
+    infer_hop_frames = int(args.infer_hop_frames) if int(args.infer_hop_frames) > 0 else infer_block_frames
+    if infer_hop_frames % int(codec_bundle.token_stride) != 0:
+        raise ValueError(
+            f"infer_hop_frames={infer_hop_frames} must be divisible by token_stride={codec_bundle.token_stride}"
+        )
+    block_tokens = max(1, int(infer_block_frames // codec_bundle.token_stride))
+    hop_tokens = max(1, int(infer_hop_frames // codec_bundle.token_stride))
+    total_tokens = int(token_prosody_t.shape[1])
+    starts = _window_starts(total_tokens, block_tokens, hop_tokens)
 
     with torch.no_grad():
-        outputs = None
-        pred_codes = None
-        for refine_idx in range(max(1, int(args.refine_iters))):
-            outputs = model(
-                token_prosody=token_prosody_t,
-                token_word_ids=token_word_ids_t,
-                token_text_scalar=token_text_scalar_t,
-                token_text_bert=token_text_bert_t,
-                token_code_inputs=token_code_inputs,
-            )
-            pred_codes = {}
+        logit_sums = {
+            name: torch.zeros((1, total_tokens, int(part.n_codes)), device=device, dtype=torch.float32)
+            for name, part in codec_bundle.vq_parts.items()
+        }
+        fusion_gate_sum = torch.zeros((1, total_tokens, 1), device=device, dtype=torch.float32)
+        hint_gate_sum = torch.zeros((1, total_tokens, 1), device=device, dtype=torch.float32)
+        counts = torch.zeros((1, total_tokens, 1), device=device, dtype=torch.float32)
+
+        for start in starts:
+            end = min(start + block_tokens, total_tokens)
+            chunk_prosody = token_prosody_t[:, start:end]
+            chunk_word_ids = token_word_ids_t[:, start:end]
+            chunk_text_scalar = token_text_scalar_t[:, start:end]
+            chunk_text_bert = token_text_bert_t[:, start:end]
+
+            token_code_inputs = None
+            if model.use_code_hints:
+                token_code_inputs = build_all_mask_code_inputs(
+                    (int(chunk_prosody.shape[0]), int(chunk_prosody.shape[1])),
+                    codebook_sizes,
+                    device,
+                )
+
+            outputs = None
+            pred_codes = None
+            for refine_idx in range(max(1, int(args.refine_iters))):
+                outputs = model(
+                    token_prosody=chunk_prosody,
+                    token_word_ids=chunk_word_ids,
+                    token_text_scalar=chunk_text_scalar,
+                    token_text_bert=chunk_text_bert,
+                    token_code_inputs=token_code_inputs,
+                )
+                pred_codes = {}
+                for name, logits in outputs["logits"].items():
+                    if name in {"upper", "hand"}:
+                        pred_codes[name] = sample_semantic_codes(
+                            logits,
+                            temperature=args.semantic_temperature,
+                            topk=args.semantic_topk,
+                        )
+                    else:
+                        pred_codes[name] = torch.argmax(logits, dim=-1)
+                if not model.use_code_hints or refine_idx >= max(1, int(args.refine_iters)) - 1:
+                    break
+                token_code_inputs = build_refine_code_inputs(
+                    pred_codes,
+                    outputs["logits"],
+                    codebook_sizes,
+                    confidence_threshold=args.refine_confidence,
+                )
+
             for name, logits in outputs["logits"].items():
-                if name in {"upper", "hand"}:
-                    pred_codes[name] = sample_semantic_codes(
-                        logits,
-                        temperature=args.semantic_temperature,
-                        topk=args.semantic_topk,
-                    )
-                else:
-                    pred_codes[name] = torch.argmax(logits, dim=-1)
-            if not model.use_code_hints or refine_idx >= max(1, int(args.refine_iters)) - 1:
-                break
-            token_code_inputs = build_refine_code_inputs(
-                pred_codes,
-                outputs["logits"],
-                codebook_sizes,
-                confidence_threshold=args.refine_confidence,
-            )
+                logit_sums[name][:, start:end] += logits.float()
+            fusion_gate_sum[:, start:end] += outputs["fusion_gate"].float()
+            hint_gate_sum[:, start:end] += outputs["hint_gate"].float()
+            counts[:, start:end] += 1.0
+
+        counts = counts.clamp_min(1.0)
+        outputs = {
+            "logits": {name: values / counts for name, values in logit_sums.items()},
+            "fusion_gate": fusion_gate_sum / counts,
+            "hint_gate": hint_gate_sum / counts,
+        }
+        pred_codes = {}
+        for name, logits in outputs["logits"].items():
+            if name in {"upper", "hand"}:
+                pred_codes[name] = sample_semantic_codes(
+                    logits,
+                    temperature=args.semantic_temperature,
+                    topk=args.semantic_topk,
+                )
+            else:
+                pred_codes[name] = torch.argmax(logits, dim=-1)
 
     decoded_parts = {
         name: codec_bundle.parts[name].decode_codes(code)[0].detach().cpu().numpy().astype(np.float32)
@@ -321,6 +389,9 @@ def main():
         "stage1_parts": list(codec_bundle.parts.keys()),
         "token_stride": codec_bundle.token_stride,
         "target_frames": target_frames,
+        "infer_block_size_frames": int(infer_block_frames),
+        "infer_hop_frames": int(infer_hop_frames),
+        "num_blocks": int(len(starts)),
         "root_mode": args.root_mode,
         "refine_iters": int(args.refine_iters),
         "refine_confidence": float(args.refine_confidence),

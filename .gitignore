@@ -15,3 +15,13 @@ w2v2_base/
 *.ckpt
 *.npz
 *.npy
+
+.claude/
+_staging/
+codex-mobile-panel/
+codex-mobile-panel-next/
+codex-mobile-sync-vscode/
+diffusion_learn/runs/
+diffusion_learn/preview_*/
+diffusion_learn/teacher_*/
+diffusion_learn/validate_*/

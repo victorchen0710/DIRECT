@@ -446,9 +446,11 @@ def find_all_foot_joint_indices(all_names, keywords):
 # Worker
 # =============================================================================
 tokenizer = None
+words_json_cache = {}
 
 def init_worker():
-    global tokenizer
+    global tokenizer, words_json_cache
+    words_json_cache = {}
     try:
         tokenizer = BertTokenizer.from_pretrained("models/bert", local_files_only=True)
     except:
@@ -487,6 +489,72 @@ def _slice_by_time(arr, start_s, end_s, fps):
     if e_idx <= s_idx:
         return None, s_idx, e_idx
     return arr[s_idx:e_idx], s_idx, e_idx
+
+
+def load_segment_word_times(item, base_dir, start_s, end_s):
+    words_json = item.get("words_json", None)
+    if not words_json:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    path = base_dir / words_json
+    if not path.exists():
+        return np.zeros((0, 2), dtype=np.float32)
+
+    cache_key = str(path)
+    obj = words_json_cache.get(cache_key)
+    if obj is None:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+        except Exception:
+            obj = None
+        words_json_cache[cache_key] = obj
+
+    if not isinstance(obj, dict):
+        return np.zeros((0, 2), dtype=np.float32)
+
+    segments = obj.get("segments", [])
+    all_words = []
+    for seg in segments:
+        ws = seg.get("words", [])
+        if isinstance(ws, list):
+            all_words.extend(ws)
+
+    if not all_words:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    wr = item.get("words_range", None)
+    if isinstance(wr, (list, tuple)) and len(wr) == 2:
+        try:
+            a = max(0, int(wr[0]))
+            b = max(a, int(wr[1]))
+            all_words = all_words[a:b]
+        except Exception:
+            pass
+
+    start_s = 0.0 if start_s is None else float(start_s)
+    end_s = float("inf") if end_s is None else float(end_s)
+
+    out = []
+    for w in all_words:
+        try:
+            st = float(w.get("start", None))
+            ed = float(w.get("end", None))
+        except Exception:
+            continue
+        if not np.isfinite(st) or not np.isfinite(ed):
+            continue
+        if ed <= start_s or st >= end_s:
+            continue
+        st = max(st, start_s)
+        ed = min(ed, end_s)
+        if ed <= st + 1e-4:
+            continue
+        out.append([st - start_s, ed - start_s])
+
+    if not out:
+        return np.zeros((0, 2), dtype=np.float32)
+    return np.asarray(out, dtype=np.float32)
 
 def process_item(args):
     item, base_dir = args
@@ -631,6 +699,8 @@ def process_item(args):
         axis=-1
     ).astype(np.float32)
 
+    word_times = load_segment_word_times(item, base_dir, start_s, end_s)
+
     # 10) Text tokens
     tokens = tokenizer(
         text=txt,
@@ -674,6 +744,7 @@ def process_item(args):
         "text_ids": tokens.input_ids[0].numpy(),
         "text_mask": tokens.attention_mask[0].numpy(),
         "audio": audio,
+        "word_times": word_times,
         "motion_len": int(T_clip),
         "audio_len": int(audio.shape[0]),
         "src_bvh": str(bvh_path),
@@ -693,6 +764,36 @@ def process_item(args):
         }
     }
     return [clip]
+
+
+def compute_feature_stats(clips, key):
+    total = None
+    total_sq = None
+    count = 0
+    for clip in clips:
+        arr = np.asarray(clip[key], dtype=np.float32)
+        if arr.size == 0:
+            continue
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        arr64 = arr.astype(np.float64, copy=False)
+        s = arr64.sum(axis=0)
+        ss = np.square(arr64).sum(axis=0)
+        if total is None:
+            total = s
+            total_sq = ss
+        else:
+            total += s
+            total_sq += ss
+        count += int(arr.shape[0])
+
+    if total is None or total_sq is None or count <= 0:
+        raise RuntimeError(f"No valid data found while computing stats for key={key}")
+
+    mean = total / float(count)
+    var = np.maximum(total_sq / float(count) - np.square(mean), 0.0)
+    std = np.sqrt(var + 1e-6)
+    return mean.astype(np.float32), std.astype(np.float32)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -725,16 +826,16 @@ def main():
     if not clips:
         raise RuntimeError("No clips generated!")
 
-    # Stats (motion)
-    m = np.concatenate([c["motion"] for c in clips], axis=0)
-    mean = np.mean(m, axis=0)
-    std = np.std(m, axis=0) + 1e-6
+    # Stats
+    mean, std = compute_feature_stats(clips, "motion")
+    audio_mean, audio_std = compute_feature_stats(clips, "audio")
 
     # Meta
     root_dim = 6
     has_yaw_vel = 1
     contact_dim = int(clips[0]["contact_dim"])
     rot6d_start = root_dim + has_yaw_vel + contact_dim
+    contact_indices = list(range(root_dim + has_yaw_vel, rot6d_start))
 
     meta = {
         "joint_names": skel["joint_names"] if skel else None,
@@ -745,7 +846,14 @@ def main():
         "root_dim": root_dim,
         "has_yaw_vel": True,
         "contact_dim": contact_dim,
+        "contact_indices": contact_indices,
         "foot_names": clips[0]["foot_names"],
+        "layout_version": "root_pos_abs_v2",
+        "root_pos_mode": "absolute_xyz",
+        "root_pos_indices": [0, 1, 2],
+        "yaw_index": 3,
+        "local_vel_xz_indices": [4, 5],
+        "yaw_vel_index": 6,
         "rot6d_start": rot6d_start,
     }
 
@@ -769,11 +877,13 @@ def main():
         "data": clips,
         "mean": mean.astype(np.float32),
         "std": std.astype(np.float32),
+        "audio_mean": audio_mean.astype(np.float32),
+        "audio_std": audio_std.astype(np.float32),
         "fps": TARGET_FPS,
         "meta": meta,
     }, args.output)
 
-    print(f"[INFO] Generated {len(clips)} clips. Feature Dim: {m.shape[1]}")
+    print(f"[INFO] Generated {len(clips)} clips. Feature Dim: {mean.shape[0]}")
     print(f"[INFO] contact_dim(K)={contact_dim}, rot6d_start={rot6d_start}")
     print(f"[INFO] Saved to {args.output}")
 
