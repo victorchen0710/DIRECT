@@ -6,9 +6,10 @@ cache/
 checkpoints/
 outputs/
 beat/
-diffusion/
 /models/
 w2v2_base/
+diffusion/whisper_cache/
+diffusion/debug.bvh
 
 *.pt
 *.pth
